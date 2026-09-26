@@ -13,8 +13,11 @@ from app.config import load_settings
 from app.engine import PricingEngine
 from app.errors import PricingError
 from app.implied_vol import implied_vol
+from app.market_registry import MarketRegistry
 from app.models import (BatchPriceRequest, ImpliedVolRequest, PriceRequest,
+                        PortfolioScenarioRequest, PublishSnapshotRequest,
                         ScenarioRequest)
+from app.portfolio import run_portfolio_scenarios
 from app.scenarios import run_scenarios
 from app.surface import Surface
 
@@ -24,6 +27,8 @@ async def lifespan(app: FastAPI):
     settings = load_settings()
     app.state.settings = settings
     app.state.engine = PricingEngine(settings)
+    # 行情版本仓库：版本一经发布即冻结，可被多个并发请求安全共享与复用
+    app.state.market_registry = MarketRegistry()
     # 默认示例曲面（不可变，供并发查询）；生产环境可由配置/行情源替换
     app.state.vol_surface = Surface(
         maturities=[0.25, 0.5, 1.0, 2.0],
@@ -98,3 +103,19 @@ def query_surface(kind: str, maturity: float, strike: float):
 def scenarios(req: ScenarioRequest):
     engine: PricingEngine = app.state.engine
     return run_scenarios(engine, req.name, req.contracts, req.shocks, req.method)
+
+
+@app.post("/market/versions")
+def publish_market_version(req: PublishSnapshotRequest):
+    """发布（冻结）一个行情版本；版本不可变，重复发布同内容幂等。"""
+    registry: MarketRegistry = app.state.market_registry
+    registry.publish(req.snapshot)
+    return {"snapshot_id": req.snapshot.snapshot_id, "frozen": True}
+
+
+@app.post("/scenarios/portfolio")
+def portfolio_scenarios(req: PortfolioScenarioRequest):
+    """组合级情景重估：逐笔结果 + 组合价值/敏感度汇总 + 行情版本绑定。"""
+    engine: PricingEngine = app.state.engine
+    registry: MarketRegistry = app.state.market_registry
+    return run_portfolio_scenarios(engine, registry, req)

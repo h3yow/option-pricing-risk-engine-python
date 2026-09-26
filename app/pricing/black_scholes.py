@@ -65,8 +65,12 @@ def bs_price(c: Contract) -> float:
     d1, d2 = _d1_d2(c)
     df_r, df_q = math.exp(-r * t), math.exp(-q * t)
     if c.option_type is OptionType.CALL:
-        return s * df_q * _norm_cdf(d1) - k * df_r * _norm_cdf(d2)
-    return k * df_r * _norm_cdf(-d2) - s * df_q * _norm_cdf(-d1)
+        price = s * df_q * _norm_cdf(d1) - k * df_r * _norm_cdf(d2)
+    else:
+        price = k * df_r * _norm_cdf(-d2) - s * df_q * _norm_cdf(-d1)
+    # 深度虚值时两项接近相等，浮点相消可能给出约 -1e-16；期权价值以 0
+    # 为下界，钳为零避免把正常合约判成异常
+    return max(price, 0.0)
 
 
 def bs_greeks(c: Contract) -> Greeks:
