@@ -6,8 +6,10 @@ from __future__ import annotations
 
 from .config import Settings
 from .errors import ErrorCode, PricingError
+from .market import resolve_contract
 from .models import (BatchItemResult, BatchPriceResponse, Contract, ItemError,
-                     PriceResult, PricingMethod)
+                     MarketPrecedence, MarketSnapshot, PriceResult,
+                     PricingMethod)
 from .pricing.black_scholes import bs_greeks, bs_price
 from .pricing.monte_carlo import mc_price
 
@@ -26,7 +28,20 @@ class PricingEngine:
         return PriceResult(contract_id=c.contract_id, price=price,
                            greeks=bs_greeks(c), method=PricingMethod.MONTE_CARLO.value)
 
-    def price_one(self, c: Contract, method: PricingMethod) -> PriceResult:
+    def price_one(self, c: Contract, method: PricingMethod,
+                  tolerance: float | None = None,
+                  market: MarketSnapshot | None = None,
+                  precedence: MarketPrecedence = MarketPrecedence.CONTRACT_FIRST
+                  ) -> PriceResult:
+        """单笔定价。绑定行情时先按优先级合并，结果标记实际所用行情版本。"""
+        resolved = resolve_contract(c, market, precedence)
+        result = self._price_resolved(resolved, method, tolerance)
+        if market is not None:
+            result = result.model_copy(update={"market_version": market.version})
+        return result
+
+    def _price_resolved(self, c: Contract, method: PricingMethod,
+                        tolerance: float | None = None) -> PriceResult:
         if method is PricingMethod.ANALYTIC:
             return self._analytic(c)
         if method is PricingMethod.MONTE_CARLO:
@@ -34,24 +49,32 @@ class PricingEngine:
         if method is PricingMethod.CROSS_CHECK:
             analytic = self._analytic(c)
             mc = self._monte_carlo(c)
+            # 请求方可显式收紧容差；缺省用配置默认值
+            tol = tolerance if tolerance is not None else self.settings.cross_check_tolerance
             scale = max(abs(analytic.price), 1.0)
             rel_diff = abs(analytic.price - mc.price) / scale
-            if rel_diff > self.settings.cross_check_tolerance:
+            if rel_diff > tol:
                 raise PricingError(
                     ErrorCode.METHOD_DIVERGENCE,
                     f"合约 {c.contract_id} 两种定价途径分歧: 解析={analytic.price:.6f} "
                     f"蒙特卡洛={mc.price:.6f} 相对差={rel_diff:.4%} "
-                    f"超过容差 {self.settings.cross_check_tolerance:.4%}",
+                    f"超过容差 {tol:.4%}",
                     {"analytic": analytic.price, "monte_carlo": mc.price,
                      "rel_diff": rel_diff,
-                     "tolerance": self.settings.cross_check_tolerance})
+                     "tolerance": tol,
+                     "tolerance_source": "request" if tolerance is not None else "default",
+                     "criterion": "abs(analytic - monte_carlo) / max(abs(analytic), 1.0) > tolerance"})
             result = analytic.model_copy()
             result.method = PricingMethod.CROSS_CHECK.value
             return result
         raise PricingError(ErrorCode.UNKNOWN_METHOD, f"未知定价途径: {method!r}",
                            {"method": repr(method)})
 
-    def price_batch(self, contracts: list[Contract], method: PricingMethod) -> BatchPriceResponse:
+    def price_batch(self, contracts: list[Contract], method: PricingMethod,
+                    tolerance: float | None = None,
+                    market: MarketSnapshot | None = None,
+                    precedence: MarketPrecedence = MarketPrecedence.CONTRACT_FIRST
+                    ) -> BatchPriceResponse:
         if len(contracts) > self.settings.max_batch_size:
             # 超限整体拒绝，不残留部分计算结果
             raise PricingError(
@@ -63,7 +86,7 @@ class PricingEngine:
             try:
                 results.append(BatchItemResult(
                     contract_id=c.contract_id, ok=True,
-                    result=self.price_one(c, method)))
+                    result=self.price_one(c, method, tolerance, market, precedence)))
             except PricingError as e:
                 # 单笔失败隔离：记录可区分错误，继续处理其余
                 results.append(BatchItemResult(

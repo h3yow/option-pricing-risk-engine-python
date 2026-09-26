@@ -14,6 +14,7 @@ class ErrorCode(str, Enum):
     LIMIT_EXCEEDED = "LIMIT_EXCEEDED"        # 批量/迭代超上限
     CONFIG = "CONFIG"                        # 配置取值不支持
     UNKNOWN_METHOD = "UNKNOWN_METHOD"        # 未知定价途径
+    UNKNOWN_MARKET_VERSION = "UNKNOWN_MARKET_VERSION"  # 引用的行情版本不存在
 
 
 class PricingError(Exception):

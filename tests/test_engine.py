@@ -71,3 +71,64 @@ def test_put_call_parity(contract):
     lhs = bs_price(call) - bs_price(put)
     rhs = 100.0 - 100.0 * math.exp(-0.05)
     assert abs(lhs - rhs) < 1e-10, f"看跌看涨平价不成立: {lhs} vs {rhs}"
+
+
+def test_default_cross_check_succeeds_over_common_ranges(engine):
+    """默认设置下，覆盖深度实/虚值、短/长到期的常见参数批量请求整体成功。"""
+    contracts = []
+    for ot in (OptionType.CALL, OptionType.PUT):
+        for strike in (20.0, 50.0, 80.0, 100.0, 120.0, 150.0, 200.0, 300.0):
+            for ttm in (1 / 365, 7 / 365, 0.25, 1.0, 5.0, 10.0):
+                for vol in (0.05, 0.2, 0.5, 0.8):
+                    contracts.append(make_contract(
+                        contract_id=f"{ot.value}-{strike}-{ttm}-{vol}",
+                        option_type=ot, strike=strike,
+                        time_to_maturity=ttm, volatility=vol))
+    resp_failed = []
+    succeeded = 0
+    # 分块提交，尊重批量上限
+    for i in range(0, len(contracts), engine.settings.max_batch_size):
+        resp = engine.price_batch(contracts[i:i + engine.settings.max_batch_size],
+                                  PricingMethod.CROSS_CHECK)
+        succeeded += resp.succeeded
+        resp_failed.extend(r for r in resp.results if not r.ok)
+    assert not resp_failed, (
+        "默认设置下正常合约不应被判为途径分歧: "
+        + "; ".join(f"{r.contract_id}: {r.error.code} {r.error.detail}"
+                    for r in resp_failed))
+    assert succeeded == len(contracts)
+
+
+def test_request_tolerance_tightened_reports_divergence(engine):
+    """请求方显式收紧容差到无法满足 → 报分歧，并给出双方数值/容差/判定依据。"""
+    c = make_contract()
+    with pytest.raises(PricingError) as exc_info:
+        engine.price_one(c, PricingMethod.CROSS_CHECK, tolerance=1e-9)
+    err = exc_info.value
+    assert err.code is ErrorCode.METHOD_DIVERGENCE
+    d = err.detail
+    assert d["tolerance"] == 1e-9
+    assert d["tolerance_source"] == "request"
+    assert d["analytic"] > 0 and d["monte_carlo"] > 0
+    assert d["rel_diff"] > d["tolerance"]
+    assert "criterion" in d, f"应给出判定依据: {d}"
+
+
+def test_default_tolerance_source_tagged():
+    settings = Settings(cross_check_tolerance=1e-9)
+    engine = PricingEngine(settings)
+    with pytest.raises(PricingError) as exc_info:
+        engine.price_one(make_contract(), PricingMethod.CROSS_CHECK)
+    assert exc_info.value.detail["tolerance_source"] == "default"
+    assert exc_info.value.detail["tolerance"] == 1e-9
+
+
+def test_batch_item_divergence_isolated(engine):
+    """批量中请求级容差收紧导致的分歧按笔隔离，不影响其余合约。"""
+    contracts = [make_contract(contract_id="a"), make_contract(contract_id="b")]
+    resp = engine.price_batch(contracts, PricingMethod.CROSS_CHECK,
+                              tolerance=1e-9)
+    assert (resp.succeeded, resp.failed) == (0, 2)
+    assert all(r.error.code == "METHOD_DIVERGENCE" for r in resp.results)
+    resp_ok = engine.price_batch(contracts, PricingMethod.CROSS_CHECK)
+    assert resp_ok.failed == 0
