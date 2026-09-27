@@ -1,6 +1,7 @@
 """配置读取：缺失取确定默认值，非法取值在加载时拒绝。"""
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -14,6 +15,10 @@ DEFAULT_MC_PATHS = 50_000
 DEFAULT_MC_SEED = 42
 DEFAULT_CROSS_CHECK_TOLERANCE = 0.02  # 两种途径允许的相对容差
 DEFAULT_MAX_SCENARIOS = 64
+
+# 请求级一致性容差的硬下限：低于此值（含 0/负数/NaN）视为非法并拒绝请求，
+# 不悄悄回落到默认容差。与服务级配置下限保持一致。
+MIN_CROSS_CHECK_TOLERANCE = 1e-9
 
 
 @dataclass(frozen=True)
@@ -60,3 +65,29 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         cross_check_tolerance=_parse_float("OPE_CROSS_CHECK_TOLERANCE", env.get("OPE_CROSS_CHECK_TOLERANCE", str(s.cross_check_tolerance)), 1e-9),
         max_scenarios=_parse_int("OPE_MAX_SCENARIOS", env.get("OPE_MAX_SCENARIOS", str(s.max_scenarios)), 1),
     )
+
+
+def resolve_cross_check_tolerance(tolerance: float | None,
+                                  default: float) -> float:
+    """解析单次请求的一致性容差。
+
+    - None（未传）：沿用服务默认，默认行为不变；
+    - 显式传入：必须是有限实数且 >= MIN_CROSS_CHECK_TOLERANCE，否则以
+      VALIDATION 明确拒绝（不静默当作未传处理）。
+    """
+    if tolerance is None:
+        return default
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) \
+            or not math.isfinite(tolerance):
+        raise PricingError(
+            ErrorCode.VALIDATION,
+            f"cross_check_tolerance 必须是有限数值，收到 {tolerance!r}",
+            {"field": "cross_check_tolerance", "value": repr(tolerance)})
+    if tolerance < MIN_CROSS_CHECK_TOLERANCE:
+        raise PricingError(
+            ErrorCode.VALIDATION,
+            f"cross_check_tolerance={tolerance:g} 小于允许下限 "
+            f"{MIN_CROSS_CHECK_TOLERANCE:g}",
+            {"field": "cross_check_tolerance", "value": tolerance,
+             "minimum": MIN_CROSS_CHECK_TOLERANCE})
+    return float(tolerance)

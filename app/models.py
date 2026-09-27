@@ -58,11 +58,20 @@ class MarketPrecedence(str, Enum):
 class PriceRequest(BaseModel):
     contract: Contract
     method: PricingMethod = PricingMethod.CROSS_CHECK
+    # 请求级一致性容差：None 表示沿用服务默认（OPE_CROSS_CHECK_TOLERANCE）；
+    # 显式传入时必须为 >= 1e-9 的有限正数，否则请求被拒绝
+    cross_check_tolerance: float | None = None
 
 
 class BatchPriceRequest(BaseModel):
     contracts: list[Contract] = Field(default_factory=list)
     method: PricingMethod = PricingMethod.CROSS_CHECK
+    # 请求级一致性容差（同上）
+    cross_check_tolerance: float | None = None
+    # 行情版本绑定：None 表示不绑定，按合约自带取值（兼容既有行为）
+    market_version: str | None = None
+    # 合约级取值与行情版本之间的优先级
+    precedence: MarketPrecedence = MarketPrecedence.CONTRACT
 
 
 class Greeks(BaseModel):
@@ -90,6 +99,8 @@ class BatchItemResult(BaseModel):
     contract_id: str
     ok: bool
     result: PriceResult | None = None
+    # 该笔记价实际使用的行情版本（未绑定为 None）；失败腿同样回带
+    market_version: str | None = None
     error: ItemError | None = None
 
 
@@ -97,6 +108,8 @@ class BatchPriceResponse(BaseModel):
     results: list[BatchItemResult]
     succeeded: int
     failed: int
+    # 本次请求实际绑定的行情版本（未绑定为 None）
+    market_version: str | None = None
 
 
 class ImpliedVolRequest(BaseModel):
@@ -128,6 +141,11 @@ class ScenarioRequest(BaseModel):
     shocks: list[Shock]
     contracts: list[Contract]
     method: PricingMethod = PricingMethod.ANALYTIC
+    # 请求级一致性容差（同 PriceRequest）
+    cross_check_tolerance: float | None = None
+    # 行情版本绑定（同 BatchPriceRequest）
+    market_version: str | None = None
+    precedence: MarketPrecedence = MarketPrecedence.CONTRACT
 
 
 class ScenarioLegResult(BaseModel):
@@ -136,6 +154,8 @@ class ScenarioLegResult(BaseModel):
     base_price: float | None = None
     shocked_price: float | None = None
     pnl: float | None = None
+    # 该笔记价实际使用的行情版本（未绑定为 None）
+    market_version: str | None = None
     error: ItemError | None = None
 
 
@@ -150,6 +170,8 @@ class ScenarioShockResult(BaseModel):
 class ScenarioResponse(BaseModel):
     name: str
     shocks: list[ScenarioShockResult]
+    # 本次请求实际绑定的行情版本（未绑定为 None）
+    market_version: str | None = None
 
 
 # ---- 组合级情景重估 ----
@@ -161,6 +183,8 @@ class PortfolioScenarioRequest(BaseModel):
     contracts: list[Contract]
     shocks: list[Shock]
     method: PricingMethod = PricingMethod.ANALYTIC
+    # 请求级一致性容差（同 PriceRequest）
+    cross_check_tolerance: float | None = None
     # 行情版本绑定：同一请求内所有合约共享同一版本；None 表示不绑定
     market_version: str | None = None
     # 合约级取值与行情版本的优先级

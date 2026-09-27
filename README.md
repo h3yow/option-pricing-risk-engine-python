@@ -7,7 +7,7 @@
 
 ```bash
 uv run uvicorn main:app --reload   # 服务
-uv run pytest                      # 测试（86 个用例）
+uv run pytest                      # 测试（129 个用例）
 ```
 
 ## 定价约定
@@ -36,8 +36,28 @@ uv run pytest                      # 测试（86 个用例）
 保证该范围内批量 `cross_check` 整体成功**。仅当请求方显式把容差收紧到确实
 无法满足（如 1e-9）时才返回 `METHOD_DIVERGENCE`，并在 `detail` 中一并给出
 `analytic`/`monte_carlo` 双方数值、实际 `rel_diff`、所用 `tolerance` 及判定
-依据（`rel_diff > tolerance`），方便区分是参数问题还是途径问题。解析价在
+依据（`criterion = "rel_diff > tolerance"`，并附 `rel_diff_formula` 计算式），
+方便区分是参数问题还是途径问题。解析价在
 深度虚值相消产生约 1e-16 的负值时按经济下界钳为 0，不影响平价等数值关系。
+
+#### 单次请求级一致性容差（`cross_check_tolerance`）
+
+除服务级默认外，`POST /price`、`POST /price/batch`、`POST /scenarios`、
+`POST /scenarios/portfolio` 均支持可选请求字段 `cross_check_tolerance`：
+
+- **不传（`null`/缺省）**：沿用服务默认 2%，行为与历史完全一致。
+- **显式传入**：必须是有限实数且 `>= 1e-9`；该值在**当次请求的所有逐笔
+  定价（基准与冲击后重估）**中真正参与判定。收紧到无法满足时，单笔
+  `/price` 返回 422 `METHOD_DIVERGENCE`；批量/情景/组合为逐笔隔离失败，
+  错误 `detail` 同样附双方数值、实际所用 `tolerance`、`rel_diff` 与判定
+  依据，且其中的 `tolerance` 就是本次请求实际使用的值。
+- **无法识别或非法的取值**（如字符串、`0`、负数、低于 `1e-9`、NaN/Inf）：
+  请求被明确拒绝（`VALIDATION`，`detail.field=cross_check_tolerance`），
+  **绝不当作没传而静默按默认处理**；批量/情景/组合在任何逐笔计算之前
+  整体拒绝，不残留部分结果。
+- 该参数只影响 `cross_check` 的一致性判定：对 `analytic`/`monte_carlo`
+  单途径请求，合法取值不改变定价结果（无副作用），但**非法取值仍会被
+  明确拒绝**（参数合法性在途径分派之前统一校验，不会被静默忽略）。
 
 ## 隐含波动率反解
 
@@ -55,11 +75,15 @@ uv run pytest                      # 测试（86 个用例）
 - 查询点超出网格范围一律抛 `OUT_OF_SURFACE`，**不静默外推**。
 - 插值随查询点连续变化；纯函数实现，重复/并发查询结果稳定。
 
-## 情景重估
+## 情景重估（`POST /scenarios`）
 
-- 冲击（`spot_pct` 相对、`vol_shift`/`rate_shift` 绝对加点）生成新合约对象，不修改原合约。
+- 冲击（`spot_pct` 相对、`vol_shift`/`rate_shift` 绝对加点）作用在按优先级
+  解析后的记价合约上，生成新合约对象，不修改原合约。
 - `total_pnl` 仅累加成功腿，与逐笔 `pnl` 严格一致（测试断言 < 1e-9）。
 - 单笔失败（基准或冲击后非法）隔离为腿级错误，不影响其余结果。
+- 支持请求级 `cross_check_tolerance`（见上）与行情版本绑定（见下）；
+  每条腿回带实际使用的 `market_version`，响应顶层 `market_version` 标明
+  本次绑定版本（未绑定为 `null`）。
 
 ## 组合级情景重估（`POST /scenarios/portfolio`）
 
@@ -88,18 +112,28 @@ uv run pytest                      # 测试（86 个用例）
   存入内存版本仓库，只增不改。
 - 重复发布：内容相同幂等成功；版本相同但内容不同 → `VERSION_CONFLICT`，
   绝不覆盖。引用未发布版本 → `VERSION_NOT_FOUND`（请求级失败）。
-- 组合请求用 `market_version` 绑定版本，**同一请求内所有合约共享同一份
-  行情状态**；每条腿结果回带 `market_version`，可辨认该笔记价实际用了哪一版。
-- 取值优先级由请求级 `precedence` 控制：
+- **三个重估入口均可绑定版本**：`POST /price/batch`、`POST /scenarios`、
+  `POST /scenarios/portfolio` 都接受 `market_version` + `precedence`。
+  绑定后**同一请求内所有合约共享同一份冻结行情状态**；快照在任何逐笔
+  定价之前解析，引用不存在的版本时**整体拒绝（`VERSION_NOT_FOUND`），
+  不残留任何部分计算结果**，引擎/仓库继续服务后续请求。
+- 每笔记价结果都回带实际使用的版本：批量的 `results[].market_version`
+  （及响应顶层 `market_version`）、情景的 `shocks[].legs[].market_version`
+  （及响应顶层）、组合的 `legs[].market_version`（成功腿与失败腿都带）；
+  未绑定时这些字段为 `null`，可据此辨认每笔记价实际用了哪一版行情。
+- 取值优先级由请求级 `precedence` 控制（三个入口规则一致）：
   - `contract`（**默认，兼容既有行为**）：合约自带字段优先，绑定仅作为版本
     标注并保证该请求共享同一版本；
   - `snapshot`：版本行情覆盖 `spot / risk_free_rate / dividend_yield /
-    volatility`。版本缺少 `volatility` 时该笔以 `MARKET_DATA_MISSING`
-    逐笔失败（`detail.field=volatility`），不影响同组合其余合约。
+    volatility`，冲击也作用在解析后的记价合约上。版本缺少 `volatility`
+    时该笔以 `MARKET_DATA_MISSING` 逐笔失败（`detail.field=volatility`），
+    不影响同请求其余合约。
 - **一致性与无半更新**：仓库用锁保护字典读写，读路径在锁内取出不可变快照
   引用后立即释放；定价全程面对冻结对象。无论先发还是并发发出的多个请求，
   只要引用同一版本，结果（含浮点值）完全一致（测试逐位比较
-  `model_dump()`）；任何请求都不会读到被中途改动的半更新行情。
+  `model_dump()`）；任何请求都不会读到被中途改动的半更新行情。绑定版本
+  可与请求级 `cross_check_tolerance` 同时使用，容差作用于版本行情解析后
+  的记价合约。
 
 ## 错误码
 
@@ -138,8 +172,9 @@ uv run pytest                      # 测试（86 个用例）
 
 引擎对定价无状态：不缓存合约级结果，每次调用独立计算；曲面构造后不可变；
 蒙特卡洛每次调用使用独立 RNG（分层抽样）。行情版本仓库以锁保护字典、存的是
-冻结快照，发布只增不改。多线程并发定价/查询/反解/引用同一行情版本的组合重估
-结果与单线程逐位一致（见 `tests/test_concurrency.py`）。
+冻结快照，发布只增不改。多线程并发定价/查询/反解/引用同一行情版本的批量定价、
+情景与组合重估结果与单线程逐位一致（见 `tests/test_concurrency.py` 与
+`tests/test_version_concurrency.py`）。
 
 > 行情版本保存在进程内存中，服务重启后需重新发布；当前版本面向单进程部署，
 > 多实例部署需在外部统一行情源/版本仓库（兼容范围说明）。
@@ -147,21 +182,29 @@ uv run pytest                      # 测试（86 个用例）
 ## 接口
 
 - `GET /` — 兼容原有接口
-- `POST /price` — 单笔定价（含希腊字母）
-- `POST /price/batch` — 批量定价，逐笔隔离失败
+- `POST /price` — 单笔定价（含希腊字母），支持请求级 `cross_check_tolerance`
+- `POST /price/batch` — 批量定价，逐笔隔离失败；支持请求级容差与
+  行情版本绑定（`market_version` + `precedence`）
 - `POST /implied-vol` — 隐含波动率反解
 - `GET /surface/{vol|rate}?maturity=&strike=` — 曲面查询
-- `POST /scenarios` — 情景冲击批量重估与汇总（既有，保持不变）
+- `POST /scenarios` — 情景冲击批量重估与汇总（兼容既有请求），支持请求级
+  容差与行情版本绑定
 - `POST /market/versions` — 发布（冻结）一个行情版本；同内容幂等、异内容冲突
 - `POST /scenarios/portfolio` — 组合级情景重估：逐笔 + 组合价值/敏感度汇总 +
-  行情版本绑定与优先级
+  行情版本绑定、优先级与请求级容差
 
 ## 兼容性
 
 - 既有 `POST /scenarios`、`POST /price*`、`POST /implied-vol`、
-  `GET /surface/*`、`GET /` 的请求/响应结构不变；`MarketSnapshot` 新增的
-  `volatility` 为可选字段；`precedence` 默认 `contract`，不绑定版本时
-  组合行为与既有合约列表情景一致。
+  `GET /surface/*`、`GET /` 的**既有请求字段与响应字段全部保留**：
+  - 新增的 `cross_check_tolerance` 为可选字段，缺省/`null` 时行为不变；
+  - `market_version` / `precedence` 为可选字段，不绑定时批量定价与情景
+    重估行为与既有合约列表入口一致（逐笔/顶层 `market_version` 为
+    `null`，属于新增的可选响应字段，不改变既有字段的取值）；
+  - `MarketSnapshot` 的 `volatility` 为可选字段；`precedence` 默认
+    `contract`。
+- 所有新增能力均为**加法式（additive）扩展**：旧请求体无需任何改动即可
+  得到与升级前完全一致的结果（既有用例全量保留并通过）。
 - 蒙特卡洛由对偶变量改为分层抽样，属于同一独立途径的内部方差缩减，固定种子
   仍逐位可复现；默认 2% 容差不变，但正常参数范围内的可用性显著增强。
 
@@ -176,8 +219,19 @@ uv run pytest -v
 - `test_validation.py` — 非法参数（到期非正、负波动率、NaN/Inf、零波动率合法退化）
 - `test_implied_vol.py` — 往返一致、越界/无解/不收敛拒绝、结果非负
 - `test_surface.py` — 范围外拒绝、插值连续、重复稳定、不可变
-- `test_engine.py` — 双途径容差、分歧上报、批量上限、部分失败、平价关系
+- `test_engine.py` — 双途径容差、分歧上报（含 `criterion`/`rel_diff_formula`）、批量上限、部分失败、平价关系
 - `test_scenarios.py` — 汇总一致性、单笔失败隔离、冲击后非法、数量缩放
+- `test_request_tolerance.py` — 四个入口的请求级容差：缺省走默认且结果
+  不变、显式收紧才报分歧且附双方数值/实际容差/判定依据（并验证收紧确实
+  改变判定，而非与默认结果雷同）、字符串/0/负数/过小/NaN/Inf/未知枚举
+  明确拒绝且批量/情景在计算前整体拒绝、无残留
+- `test_version_binding.py` — 批量定价与情景重估的版本绑定与优先级
+  （contract/snapshot）、逐笔及顶层版本标注、冲击作用于版本解析合约、
+  缺 volatility 腿级失败、未知版本整体拒绝且无部分结果/服务可继续、
+  版本与收紧容差组合生效
+- `test_version_concurrency.py` — 批量与情景引用同一版本在先发与并发
+  请求下逐位一致（cross_check 路径同样覆盖）、未知版本并发全拒、
+  并发异内容覆盖发布全拒且绑定读取不漂移（无半更新）
 - `test_portfolio.py` — 组合价值/敏感度汇总与逐笔严格一致、加权希腊字母、
   基准失败与冲击失败分别隔离、版本优先级、字段缺失逐笔失败、未知版本与
   超限整体拒绝且无残留

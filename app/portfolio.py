@@ -12,14 +12,18 @@
 """
 from __future__ import annotations
 
+from .config import resolve_cross_check_tolerance
 from .engine import PricingEngine
 from .errors import ErrorCode, PricingError
+from .market import resolve_market
 from .market_registry import MarketRegistry
-from .models import (Contract, ItemError, MarketPrecedence, MarketSnapshot,
-                     PortfolioGreeks, PortfolioLegResult,
+from .models import (Contract, ItemError, PortfolioGreeks, PortfolioLegResult,
                      PortfolioScenarioRequest, PortfolioScenarioResponse,
                      PortfolioShockResult, PriceResult)
 from .scenarios import apply_shock
+
+# 向后兼容：历史调用方从 app.portfolio 导入 resolve_market
+__all__ = ["resolve_market", "run_portfolio_scenarios"]
 
 
 def _scale_greeks(result: PriceResult, quantity: float) -> PortfolioGreeks:
@@ -30,40 +34,14 @@ def _scale_greeks(result: PriceResult, quantity: float) -> PortfolioGreeks:
         rho=g.rho * quantity)
 
 
-def resolve_market(c: Contract, snapshot: MarketSnapshot | None,
-                   precedence: MarketPrecedence
-                   ) -> tuple[Contract | None, str | None, ItemError | None]:
-    """按优先级把合约字段与行情版本解析为实际记价合约。
-
-    返回 (解析后合约, 实际行情版本, 错误)。snapshot 为 None 时不绑定版本。
-    """
-    if snapshot is None:
-        return c, None, None
-    version = snapshot.snapshot_id
-    if precedence is MarketPrecedence.CONTRACT:
-        # 合约级取值优先：绑定仅标记版本，字段以合约为准（兼容既有行为）
-        return c, version, None
-    # SNAPSHOT：行情版本覆盖标的/利率/股息；波动率在版本缺失时逐笔失败
-    if snapshot.volatility is None:
-        return None, version, ItemError(
-            code=ErrorCode.MARKET_DATA_MISSING.value,
-            message=(f"行情版本 {version!r} 未提供 volatility，"
-                     f"precedence=snapshot 下合约 {c.contract_id} 无法记价"),
-            detail={"snapshot_id": version, "field": "volatility",
-                    "contract_id": c.contract_id})
-    resolved = c.model_copy(update={
-        "spot": snapshot.spot,
-        "risk_free_rate": snapshot.risk_free_rate,
-        "dividend_yield": snapshot.dividend_yield,
-        "volatility": snapshot.volatility,
-    })
-    return resolved, version, None
-
-
 def run_portfolio_scenarios(engine: PricingEngine,
                             registry: MarketRegistry,
                             req: PortfolioScenarioRequest
                             ) -> PortfolioScenarioResponse:
+    # 0) 请求级容差在任何计算之前解析：非法取值整体拒绝，不残留部分结果
+    tolerance = resolve_cross_check_tolerance(
+        req.cross_check_tolerance, engine.settings.cross_check_tolerance)
+
     # 1) 上限校验：整体拒绝，发生在任何计算之前
     if len(req.contracts) > engine.settings.max_batch_size:
         raise PricingError(
@@ -97,7 +75,7 @@ def run_portfolio_scenarios(engine: PricingEngine,
             base_err[c.contract_id] = mkt_err
             continue
         try:
-            r = engine.price_one(resolved, req.method)
+            r = engine.price_one(resolved, req.method, tolerance)
             base_value[c.contract_id] = r.price * c.quantity
             resolved_contracts[c.contract_id] = resolved
         except PricingError as e:
@@ -122,7 +100,7 @@ def run_portfolio_scenarios(engine: PricingEngine,
                 continue
             try:
                 shocked = apply_shock(resolved_contracts[cid], shock)
-                r = engine.price_one(shocked, req.method)
+                r = engine.price_one(shocked, req.method, tolerance)
                 sv = r.price * c.quantity
                 legs.append(PortfolioLegResult(
                     contract_id=cid, shock_index=idx, ok=True,

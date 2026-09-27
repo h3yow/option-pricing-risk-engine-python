@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.batching import run_batch_pricing
 from app.config import load_settings
 from app.engine import PricingEngine
 from app.errors import PricingError
@@ -66,13 +67,17 @@ def read_root():
 @app.post("/price")
 def price(req: PriceRequest):
     engine: PricingEngine = app.state.engine
-    return engine.price_one(req.contract, req.method)
+    return engine.price_one(req.contract, req.method,
+                            req.cross_check_tolerance)
 
 
 @app.post("/price/batch")
 def price_batch(req: BatchPriceRequest):
     engine: PricingEngine = app.state.engine
-    return engine.price_batch(req.contracts, req.method)
+    registry: MarketRegistry = app.state.market_registry
+    return run_batch_pricing(
+        engine, registry, req.contracts, req.method,
+        req.cross_check_tolerance, req.market_version, req.precedence)
 
 
 @app.post("/implied-vol")
@@ -102,7 +107,13 @@ def query_surface(kind: str, maturity: float, strike: float):
 @app.post("/scenarios")
 def scenarios(req: ScenarioRequest):
     engine: PricingEngine = app.state.engine
-    return run_scenarios(engine, req.name, req.contracts, req.shocks, req.method)
+    registry: MarketRegistry = app.state.market_registry
+    # 版本不存在时在任何计算之前整体拒绝（VERSION_NOT_FOUND）
+    snapshot = None if req.market_version is None else registry.get(
+        req.market_version)
+    return run_scenarios(engine, req.name, req.contracts, req.shocks,
+                         req.method, req.cross_check_tolerance, snapshot,
+                         req.precedence)
 
 
 @app.post("/market/versions")
