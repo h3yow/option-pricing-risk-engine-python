@@ -6,10 +6,12 @@
 """
 from __future__ import annotations
 
-from .engine import PricingEngine
+from .engine import PricingEngine, resolve_market
 from .errors import ErrorCode, PricingError
-from .models import (Contract, ItemError, PricingMethod, ScenarioLegResult,
-                     ScenarioResponse, ScenarioShockResult, Shock)
+from .models import (Contract, ItemError, MarketPrecedence, MarketSnapshot,
+                     PricingMethod, ScenarioLegResult, ScenarioResponse,
+                     ScenarioShockResult, Shock,
+                     validate_cross_check_tolerance)
 
 
 def apply_shock(c: Contract, shock: Shock) -> Contract:
@@ -22,7 +24,13 @@ def apply_shock(c: Contract, shock: Shock) -> Contract:
 
 
 def run_scenarios(engine: PricingEngine, name: str, contracts: list[Contract],
-                  shocks: list[Shock], method: PricingMethod) -> ScenarioResponse:
+                  shocks: list[Shock], method: PricingMethod,
+                  cross_check_tolerance: float | None = None,
+                  snapshot: MarketSnapshot | None = None,
+                  precedence: MarketPrecedence = MarketPrecedence.CONTRACT
+                  ) -> ScenarioResponse:
+    # 非法容差在任何计算之前拒绝（不残留部分结果）
+    validate_cross_check_tolerance(cross_check_tolerance)
     if len(shocks) > engine.settings.max_scenarios:
         raise PricingError(
             ErrorCode.LIMIT_EXCEEDED,
@@ -34,12 +42,23 @@ def run_scenarios(engine: PricingEngine, name: str, contracts: list[Contract],
             f"合约数量 {len(contracts)} 超过上限 {engine.settings.max_batch_size}",
             {"count": len(contracts), "limit": engine.settings.max_batch_size})
 
-    # 基准价格逐笔计算一次；失败腿在所有情景中保持失败
+    # 基准价格逐笔计算一次；失败腿在所有情景中保持失败。
+    # 版本绑定在请求级解析：基准与全部冲击共享同一份冻结行情快照。
     base: dict[str, float | None] = {}
+    base_version: dict[str, str | None] = {}
     base_err: dict[str, ItemError] = {}
+    resolved_contracts: dict[str, Contract] = {}
     for c in contracts:
+        resolved, version, mkt_err = resolve_market(c, snapshot, precedence)
+        base_version[c.contract_id] = version
+        if mkt_err is not None:
+            base[c.contract_id] = None
+            base_err[c.contract_id] = mkt_err
+            continue
         try:
-            base[c.contract_id] = engine.price_one(c, method).price * c.quantity
+            r = engine.price_one(resolved, method, cross_check_tolerance)
+            base[c.contract_id] = r.price * c.quantity
+            resolved_contracts[c.contract_id] = resolved
         except PricingError as e:
             base[c.contract_id] = None
             base_err[c.contract_id] = ItemError(**e.to_dict())
@@ -49,24 +68,33 @@ def run_scenarios(engine: PricingEngine, name: str, contracts: list[Contract],
         legs: list[ScenarioLegResult] = []
         total_pnl = 0.0
         for c in contracts:
-            bp = base[c.contract_id]
+            cid = c.contract_id
+            bp = base[cid]
+            version = base_version[cid]
             if bp is None:
-                legs.append(ScenarioLegResult(contract_id=c.contract_id, ok=False,
-                                              error=base_err[c.contract_id]))
+                legs.append(ScenarioLegResult(contract_id=cid, ok=False,
+                                              market_version=version,
+                                              error=base_err[cid]))
                 continue
             try:
-                shocked = apply_shock(c, shock)
-                sp = engine.price_one(shocked, method).price * c.quantity
-                legs.append(ScenarioLegResult(contract_id=c.contract_id, ok=True,
+                shocked = apply_shock(resolved_contracts[cid], shock)
+                sp = engine.price_one(shocked, method,
+                                      cross_check_tolerance).price * c.quantity
+                legs.append(ScenarioLegResult(contract_id=cid, ok=True,
                                               base_price=bp, shocked_price=sp,
-                                              pnl=sp - bp))
+                                              pnl=sp - bp,
+                                              market_version=version))
                 total_pnl += sp - bp
             except PricingError as e:
-                legs.append(ScenarioLegResult(contract_id=c.contract_id, ok=False,
+                legs.append(ScenarioLegResult(contract_id=cid, ok=False,
                                               base_price=bp,
+                                              market_version=version,
                                               error=ItemError(**e.to_dict())))
         succeeded = sum(1 for leg in legs if leg.ok)
         shock_results.append(ScenarioShockResult(
             shock_index=idx, total_pnl=total_pnl, legs=legs,
             succeeded=succeeded, failed=len(legs) - succeeded))
-    return ScenarioResponse(name=name, shocks=shock_results)
+    return ScenarioResponse(
+        name=name,
+        market_version=snapshot.snapshot_id if snapshot else None,
+        precedence=precedence.value, shocks=shock_results)

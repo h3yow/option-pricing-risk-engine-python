@@ -1,10 +1,39 @@
 """合约、行情快照与请求/响应模型。"""
 from __future__ import annotations
 
+import math
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+from .errors import ErrorCode, PricingError
+
+
+def validate_cross_check_tolerance(tolerance: float | None) -> float | None:
+    """校验请求级 cross_check 容差：None 表示沿用默认；否则须为正有限数值。
+
+    无法识别（如字符串/布尔）或非法（NaN/Inf/≤0）的取值明确拒绝
+    （VALIDATION），绝不当作没传悄悄按默认处理。
+    """
+    if tolerance is None:
+        return None
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise PricingError(
+            ErrorCode.VALIDATION,
+            f"cross_check_tolerance 必须是数值，收到 {tolerance!r}",
+            {"field": "cross_check_tolerance", "value": repr(tolerance)})
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise PricingError(
+            ErrorCode.VALIDATION,
+            f"cross_check_tolerance 必须是正的有限数值，收到 {tolerance!r}",
+            {"field": "cross_check_tolerance", "value": tolerance})
+    return float(tolerance)
+
+
+# 请求级双途径一致性容差：缺省（None）走配置默认；传入即严格校验
+CrossCheckTolerance = Annotated[
+    float | None, BeforeValidator(validate_cross_check_tolerance)]
 
 
 class OptionType(str, Enum):
@@ -58,11 +87,18 @@ class MarketPrecedence(str, Enum):
 class PriceRequest(BaseModel):
     contract: Contract
     method: PricingMethod = PricingMethod.CROSS_CHECK
+    # 请求级双途径一致性容差；None 时沿用 OPE_CROSS_CHECK_TOLERANCE 默认
+    cross_check_tolerance: CrossCheckTolerance = None
 
 
 class BatchPriceRequest(BaseModel):
     contracts: list[Contract] = Field(default_factory=list)
     method: PricingMethod = PricingMethod.CROSS_CHECK
+    cross_check_tolerance: CrossCheckTolerance = None
+    # 行情版本绑定：整批共享同一版本；None 表示不绑定（兼容既有行为）
+    market_version: str | None = None
+    # 合约级取值与行情版本的优先级
+    precedence: MarketPrecedence = MarketPrecedence.CONTRACT
 
 
 class Greeks(BaseModel):
@@ -91,12 +127,16 @@ class BatchItemResult(BaseModel):
     ok: bool
     result: PriceResult | None = None
     error: ItemError | None = None
+    market_version: str | None = None  # 该笔记价实际使用的行情版本（未绑定为 None）
 
 
 class BatchPriceResponse(BaseModel):
     results: list[BatchItemResult]
     succeeded: int
     failed: int
+    # 本次批量实际绑定的行情版本与取值优先级（未绑定时为 None/"contract"）
+    market_version: str | None = None
+    precedence: str = MarketPrecedence.CONTRACT.value
 
 
 class ImpliedVolRequest(BaseModel):
@@ -128,6 +168,11 @@ class ScenarioRequest(BaseModel):
     shocks: list[Shock]
     contracts: list[Contract]
     method: PricingMethod = PricingMethod.ANALYTIC
+    # 请求级双途径一致性容差；None 时沿用默认
+    cross_check_tolerance: CrossCheckTolerance = None
+    # 行情版本绑定：整个请求（基准+全部冲击）共享同一版本；None 不绑定
+    market_version: str | None = None
+    precedence: MarketPrecedence = MarketPrecedence.CONTRACT
 
 
 class ScenarioLegResult(BaseModel):
@@ -136,6 +181,7 @@ class ScenarioLegResult(BaseModel):
     base_price: float | None = None
     shocked_price: float | None = None
     pnl: float | None = None
+    market_version: str | None = None  # 该笔记价实际使用的行情版本（未绑定为 None）
     error: ItemError | None = None
 
 
@@ -149,6 +195,8 @@ class ScenarioShockResult(BaseModel):
 
 class ScenarioResponse(BaseModel):
     name: str
+    market_version: str | None = None
+    precedence: str = MarketPrecedence.CONTRACT.value
     shocks: list[ScenarioShockResult]
 
 
@@ -161,6 +209,8 @@ class PortfolioScenarioRequest(BaseModel):
     contracts: list[Contract]
     shocks: list[Shock]
     method: PricingMethod = PricingMethod.ANALYTIC
+    # 请求级双途径一致性容差；None 时沿用默认
+    cross_check_tolerance: CrossCheckTolerance = None
     # 行情版本绑定：同一请求内所有合约共享同一版本；None 表示不绑定
     market_version: str | None = None
     # 合约级取值与行情版本的优先级

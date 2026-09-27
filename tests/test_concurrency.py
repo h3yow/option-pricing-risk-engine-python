@@ -145,3 +145,103 @@ def test_concurrent_publish_distinct_versions_then_reads_consistent(engine):
     with ThreadPoolExecutor(max_workers=8) as pool:
         rows2 = list(pool.map(read, range(32)))
     assert rows == rows2
+
+
+def test_concurrent_batch_same_version_identical(engine):
+    # 批量定价：先发一次，再与并发请求逐位比较（含每笔 market_version 标注）
+    reg = MarketRegistry()
+    reg.publish(MarketSnapshot(snapshot_id="cv", spot=103.0,
+                               risk_free_rate=0.04, dividend_yield=0.01,
+                               volatility=0.23))
+    contracts = [make_contract(contract_id=f"c{i}", strike=90 + i * 3)
+                 for i in range(8)]
+    snap = reg.get("cv")
+    seq = engine.price_batch(contracts, PricingMethod.ANALYTIC, None, snap,
+                             MarketPrecedence.SNAPSHOT).model_dump()
+
+    def work(_):
+        return engine.price_batch(contracts, PricingMethod.ANALYTIC, None,
+                                  snap, MarketPrecedence.SNAPSHOT
+                                  ).model_dump()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        runs = list(pool.map(work, range(32)))
+    for i, r in enumerate(runs):
+        assert r == seq, f"批量引用同一版本第 {i} 个并发请求结果不一致"
+    assert all(item["market_version"] == "cv"
+               for item in seq["results"])
+
+
+def test_concurrent_scenarios_same_version_identical(engine):
+    # 情景重估：先发一次，再与并发请求逐位比较（含每条腿版本标注）
+    from app.models import Shock
+    from app.scenarios import run_scenarios
+    reg = MarketRegistry()
+    reg.publish(MarketSnapshot(snapshot_id="sv", spot=97.0,
+                               risk_free_rate=0.02, dividend_yield=0.0,
+                               volatility=0.28))
+    contracts = [make_contract(contract_id=f"c{i}", strike=95 + i * 2,
+                               quantity=1.0 - 0.1 * i) for i in range(6)]
+    shocks = [Shock(spot_pct=-0.05), Shock(vol_shift=0.02),
+              Shock(rate_shift=0.01)]
+    snap = reg.get("sv")
+    seq = run_scenarios(engine, "s", contracts, shocks,
+                        PricingMethod.ANALYTIC, None, snap,
+                        MarketPrecedence.SNAPSHOT).model_dump()
+
+    def work(_):
+        return run_scenarios(engine, "s", contracts, shocks,
+                             PricingMethod.ANALYTIC, None, snap,
+                             MarketPrecedence.SNAPSHOT).model_dump()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        runs = list(pool.map(work, range(32)))
+    for i, r in enumerate(runs):
+        assert r == seq, f"情景引用同一版本第 {i} 个并发请求结果不一致"
+    assert all(leg["market_version"] == "sv"
+               for sh in seq["shocks"] for leg in sh["legs"])
+
+
+def test_concurrent_same_version_never_reads_half_updated(engine):
+    # 并发尝试覆盖已发布版本必须全部被拒；期间与之后的批量/情景读取不漂移
+    reg = MarketRegistry()
+    reg.publish(MarketSnapshot(snapshot_id="frozen", spot=100.0,
+                               risk_free_rate=0.05, volatility=0.2))
+    contracts = [make_contract(contract_id=f"c{i}", strike=95 + i)
+                 for i in range(4)]
+    snap = reg.get("frozen")
+    before_batch = engine.price_batch(
+        contracts, PricingMethod.ANALYTIC, None, snap,
+        MarketPrecedence.SNAPSHOT).model_dump()
+    from app.models import Shock
+    from app.scenarios import run_scenarios
+    shocks = [Shock(spot_pct=0.03)]
+    before_scen = run_scenarios(engine, "s", contracts, shocks,
+                                PricingMethod.ANALYTIC, None, snap,
+                                MarketPrecedence.SNAPSHOT).model_dump()
+
+    def clash(_):
+        try:
+            reg.publish(MarketSnapshot(snapshot_id="frozen", spot=200.0,
+                                       risk_free_rate=0.9, volatility=0.7))
+            return "OVERWRITTEN"
+        except PricingError as e:
+            return e.code
+
+    def read_batch(_):
+        return engine.price_batch(
+            contracts, PricingMethod.ANALYTIC, None,
+            reg.get("frozen"), MarketPrecedence.SNAPSHOT).model_dump()
+
+    def read_scen(_):
+        return run_scenarios(engine, "s", contracts, shocks,
+                             PricingMethod.ANALYTIC, None, reg.get("frozen"),
+                             MarketPrecedence.SNAPSHOT).model_dump()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        clashes = list(pool.map(clash, range(16)))
+        batches = list(pool.map(read_batch, range(16)))
+        scens = list(pool.map(read_scen, range(16)))
+    assert set(clashes) == {ErrorCode.VERSION_CONFLICT}
+    assert all(b == before_batch for b in batches)
+    assert all(s == before_scen for s in scens)
